@@ -57,6 +57,7 @@ import copy
 import os
 import re
 import gc
+import mlx_whisper
 
 # Set OpenMP runtime duplicate library handling to OK (Use only for development!)
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
@@ -294,6 +295,7 @@ class AudioToTextRecorder:
                  allowed_latency_limit: int = ALLOWED_LATENCY_LIMIT,
                  no_log_file: bool = False,
                  use_extended_logging: bool = False,
+                 transcription_backend="faster_whisper",
                  ):
         """
         Initializes an audio recorder and  transcription
@@ -503,6 +505,8 @@ class AudioToTextRecorder:
         - use_extended_logging (bool, default=False): Writes extensive
             log messages for the recording worker, that processes the audio
             chunks.
+        - transcription_backend (str): Backend to use for transcription.
+            Either "faster_whisper" or "mlx". Default is "faster_whisper".
 
         Raises:
             Exception: Errors related to initializing transcription
@@ -611,6 +615,7 @@ class AudioToTextRecorder:
         self.print_transcription_time = print_transcription_time
         self.early_transcription_on_silence = early_transcription_on_silence
         self.use_extended_logging = use_extended_logging
+        self.transcription_backend = transcription_backend
 
         # Initialize the logging configuration with the specified level
         log_format = 'RealTimeSTT: %(name)s - %(levelname)s - %(message)s'
@@ -669,25 +674,42 @@ class AudioToTextRecorder:
         # Set device for model
         self.device = "cuda" if self.device == "cuda" and torch.cuda.is_available() else "cpu"
 
-        self.transcript_process = self._start_thread(
-            target=AudioToTextRecorder._transcription_worker,
-            args=(
-                child_transcription_pipe,
-                child_stdout_pipe,
-                self.main_model_type,
-                self.download_root,
-                self.compute_type,
-                self.gpu_device_index,
-                self.device,
-                self.main_transcription_ready_event,
-                self.shutdown_event,
-                self.interrupt_stop_event,
-                self.beam_size,
-                self.initial_prompt,
-                self.suppress_tokens,
-                self.batch_size
+        if self.transcription_backend == "faster_whisper":
+            self.transcript_process = self._start_thread(
+                target=AudioToTextRecorder._transcription_worker,
+                args=(
+                    child_transcription_pipe,
+                    child_stdout_pipe,
+                    self.main_model_type,
+                    self.download_root,
+                    self.compute_type,
+                    self.gpu_device_index,
+                    self.device,
+                    self.main_transcription_ready_event,
+                    self.shutdown_event,
+                    self.interrupt_stop_event,
+                    self.beam_size,
+                    self.initial_prompt,
+                    self.suppress_tokens,
+                    self.batch_size
+                )
             )
-        )
+        elif self.transcription_backend == "mlx":
+            self.transcript_process = self._start_thread(
+                target=AudioToTextRecorder._mlx_transcription_worker,
+                args=(
+                    child_transcription_pipe,
+                    child_stdout_pipe,
+                    self.main_model_type,
+                    self.download_root,
+                    self.main_transcription_ready_event,
+                    self.shutdown_event,
+                    self.interrupt_stop_event,
+                    self.initial_prompt
+                )
+            )
+        else:
+            raise ValueError(f"Unknown transcription backend: {self.transcription_backend}")
 
         # Start audio data reading process
         if self.use_microphone.value:
@@ -936,8 +958,14 @@ class AudioToTextRecorder:
                 break 
             time.sleep(0.1)
 
+    @staticmethod 
     def _transcription_worker(*args, **kwargs):
         worker = TranscriptionWorker(*args, **kwargs)
+        worker.run()
+
+    @staticmethod
+    def _mlx_transcription_worker(*args, **kwargs):
+        worker = MLXTranscriptionWorker(*args, **kwargs)
         worker.run()
 
     @staticmethod
@@ -1423,8 +1451,9 @@ class AudioToTextRecorder:
                 self._set_state("inactive")
                 if status == 'success':
                     segments, info = result
-                    self.detected_language = info.language if info.language_probability > 0 else None
-                    self.detected_language_probability = info.language_probability
+                    # import pdb; pdb.set_trace()
+                    self.detected_language = info['language'] if info['language_probability'] > 0 else None
+                    self.detected_language_probability = info['language_probability']
                     self.last_transcription_bytes = copy.deepcopy(audio_copy)                    
                     self.last_transcription_bytes_b64 = base64.b64encode(self.last_transcription_bytes.tobytes()).decode('utf-8')
                     transcription = self._preprocess_output(segments)
@@ -2650,3 +2679,99 @@ class AudioToTextRecorder:
               exception, if any.
         """
         self.shutdown()
+
+
+class MLXTranscriptionWorker:
+    def __init__(self, conn, stdout_pipe, model_path, download_root, ready_event, 
+                 shutdown_event, interrupt_stop_event, initial_prompt):
+        self.conn = conn
+        self.stdout_pipe = stdout_pipe
+        self.model_path = model_path
+        self.download_root = download_root
+        self.ready_event = ready_event
+        self.shutdown_event = shutdown_event
+        self.interrupt_stop_event = interrupt_stop_event
+        self.initial_prompt = initial_prompt
+        self.queue = queue.Queue()
+
+    def custom_print(self, *args, **kwargs):
+        message = ' '.join(map(str, args))
+        try:
+            self.stdout_pipe.send(message)
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+
+    def poll_connection(self):
+        while not self.shutdown_event.is_set():
+            if self.conn.poll(0.01):
+                try:
+                    data = self.conn.recv()
+                    self.queue.put(data)
+                except Exception as e:
+                    logging.error(f"Error receiving data from connection: {e}", exc_info=True)
+            else:
+                time.sleep(TIME_SLEEP)
+
+    def run(self):
+        if __name__ == "__main__":
+            system_signal.signal(system_signal.SIGINT, system_signal.SIG_IGN)
+            __builtins__['print'] = self.custom_print
+
+        logging.info(f"Initializing MLX Whisper model {self.model_path}")
+
+        try:
+            # Initialize model
+            self.model = mlx_whisper
+            dummy_audio = np.zeros(16000, dtype=np.float32)
+            self.model.transcribe(dummy_audio, path_or_hf_repo=self.model_path, language="en")
+
+        except Exception as e:
+            logging.exception(f"Error initializing MLX Whisper model: {e}")
+            raise
+
+        self.ready_event.set()
+        logging.debug("MLX Whisper model initialized successfully")
+
+        # Start the polling thread
+        polling_thread = threading.Thread(target=self.poll_connection)
+        polling_thread.start()
+
+        try:
+            while not self.shutdown_event.is_set():
+                try:
+                    audio, language = self.queue.get(timeout=0.1)
+                    try:
+                        logging.debug(f"Transcribing audio with language {language}")
+                        
+                        result = self.model.transcribe(
+                            audio,
+                            path_or_hf_repo=self.model_path,
+                            language=language if language else None,
+                            # initial_prompt=self.initial_prompt,
+                            initial_prompt="translate to english",
+                            # task="translate",
+                        )
+                        
+                        transcription = result['text'].strip()
+                        info = {'language': result.get('language'), 'language_probability': 1.0}
+                        
+                        logging.debug(f"Final text detected with MLX model: {transcription}")
+                        self.conn.send(('success', (transcription, info)))
+                        
+                    except Exception as e:
+                        logging.error(f"General error in transcription: {e}", exc_info=True)
+                        self.conn.send(('error', str(e)))
+                except queue.Empty:
+                    continue
+                except KeyboardInterrupt:
+                    self.interrupt_stop_event.set()
+                    logging.debug("Transcription worker process finished due to KeyboardInterrupt")
+                    break
+                except Exception as e:
+                    logging.error(f"General error in processing queue item: {e}", exc_info=True)
+        finally:
+            __builtins__['print'] = print
+            self.conn.close() 
+            self.stdout_pipe.close()
+            self.shutdown_event.set()
+            polling_thread.join()
